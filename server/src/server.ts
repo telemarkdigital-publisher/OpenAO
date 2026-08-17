@@ -30,6 +30,11 @@ const FLOOR_ITEM_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const FLOOR_ITEM_SWEEP_WARNING_MS = 60 * 1000;
 const FLOOR_ITEM_SWEEP_CHECK_MS = 5000;
 const DUPLICATE_IP_IDLE_TIMEOUT_MS = 60 * 1000;
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 8000;
+const SHUTDOWN_SIGNAL_EXIT_CODES: Partial<Record<NodeJS.Signals, number>> = {
+    SIGINT: 130,
+    SIGTERM: 143,
+};
 
 function broadcastNpcSnapshot(game: GameApi, handleProtocol: HandleProtocolApi, npc: RuntimeNpc | undefined): void {
     if (!npc) {
@@ -77,6 +82,7 @@ function broadcastCharacterSnapshot(
 
 type WSServer = {
     on: (event: "connection", listener: (client: RuntimeClient, request: RuntimeConnectionRequest) => void) => void;
+    close?: (callback?: (error?: Error) => void) => void;
 };
 
 type ServerCharacter = RuntimeCharacter & {
@@ -100,6 +106,7 @@ type ServerNpc = RuntimeNpc & {
 };
 
 let wsServer: WSServer | null = null;
+let gracefulShutdownStarted = false;
 
 function isInSafeZone(user: RuntimeCharacter | undefined) {
     if (!user) {
@@ -199,6 +206,109 @@ function handleHttpRequest(request: any, response: any) {
     response.setHeader("Content-Type", "application/json; charset=utf-8");
     response.end(JSON.stringify({ error: "Not found" }));
 }
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+            reject(new Error(message));
+        }, timeoutMs);
+        timeoutId.unref?.();
+
+        promise
+            .then(resolve, reject)
+            .finally(() => {
+                clearTimeout(timeoutId);
+            });
+    });
+}
+
+async function closeNetworkServers(): Promise<void> {
+    await Promise.allSettled([
+        new Promise<void>((resolve) => {
+            if (!wsServer?.close) {
+                resolve();
+                return;
+            }
+
+            wsServer.close(() => resolve());
+        }),
+        new Promise<void>((resolve) => {
+            if (!httpServer.listening) {
+                resolve();
+                return;
+            }
+
+            httpServer.close(() => resolve());
+        }),
+    ]);
+}
+
+function notifyClientsBeforeShutdown(signal: NodeJS.Signals): void {
+    const message = `[Servidor] El servidor se esta apagando (${signal}). Guardando sesiones...`;
+
+    console.log(message);
+    handleProtocol.consoleToAll(message, "#E69500", 1, 0);
+
+    for (const client of Object.values(vars.clients as Record<string, RuntimeClient | undefined>)) {
+        socket.flushClient(client);
+    }
+}
+
+async function resetConnectedCharactersBeforeShutdown(): Promise<number> {
+    const response = (await funct.fetchUrl("/internal/characters/reset-connected", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: vars.tokenAuth,
+        },
+    })) as { updated?: number };
+
+    return Number(response.updated ?? 0);
+}
+
+async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
+    if (gracefulShutdownStarted) {
+        return;
+    }
+
+    gracefulShutdownStarted = true;
+    vars.serverReady = false;
+    const exitCode = SHUTDOWN_SIGNAL_EXIT_CODES[signal] ?? 0;
+
+    const forceExitTimeout = setTimeout(() => {
+        console.error(
+            `[Servidor] Apagado forzado: no se completo la limpieza en ${GRACEFUL_SHUTDOWN_TIMEOUT_MS}ms.`,
+        );
+        process.exit(exitCode);
+    }, GRACEFUL_SHUTDOWN_TIMEOUT_MS + 500);
+    forceExitTimeout.unref?.();
+
+    try {
+        notifyClientsBeforeShutdown(signal);
+
+        const updated = await withTimeout(
+            resetConnectedCharactersBeforeShutdown(),
+            GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+            "Timeout al desmarcar personajes conectados durante el apagado.",
+        );
+
+        console.log(`[Servidor] Personajes marcados como desconectados al apagar: ${updated}.`);
+    } catch (error) {
+        funct.dumpError(error);
+    } finally {
+        await closeNetworkServers();
+        clearTimeout(forceExitTimeout);
+        process.exit(exitCode);
+    }
+}
+
+process.once("SIGINT", () => {
+    void gracefulShutdown("SIGINT");
+});
+
+process.once("SIGTERM", () => {
+    void gracefulShutdown("SIGTERM");
+});
 
 const PACKET_TYPE_NAMES: Record<number, string> = {
     [pkg.serverPacketID.changeHeading]: "heading",
