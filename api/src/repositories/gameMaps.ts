@@ -11,7 +11,7 @@ import {
     type GameMapRecordData,
 } from "../lib/mapData";
 
-type GameMapRow = {
+type GameMapSummaryRow = {
     id: number;
     name: string;
     terreno: string;
@@ -20,13 +20,16 @@ type GameMapRow = {
     min_level: number;
     max_level: number;
     pk: boolean;
+    version: string;
+    updated_at: Date;
+};
+
+type GameMapRow = GameMapSummaryRow & {
     metadata: GameMapRecordData["metadata"];
     terrain: GameMapRecordData["terrain"];
     npcs: GameMapRecordData["npcs"];
     specials: GameMapRecordData["specials"];
     checksum: string;
-    version: string;
-    updated_at: Date;
 };
 
 const listFiltersSchema = z.object({
@@ -66,7 +69,10 @@ function toGameMapData(row: GameMapRow): GameMapRecordData {
     );
 }
 
-function toGameMapSummary(row: GameMapRow, source: "db" | "file" = "db") {
+function toGameMapSummary(
+    row: GameMapSummaryRow,
+    source: "db" | "file" = "db",
+) {
     return {
         id: row.id,
         name: row.name,
@@ -140,10 +146,10 @@ export async function listGameMaps(filters: unknown) {
 
     values.push(pageSize);
     values.push(offset);
-    const result = await pool.query<GameMapRow>(
+    const result = await pool.query<GameMapSummaryRow>(
         `
       SELECT id, name, terreno, zona, restringir, min_level, max_level, pk,
-             metadata, terrain, npcs, specials, checksum, version::text AS version, updated_at
+             version::text AS version, updated_at
       FROM game_maps
       ${whereClause}
       ORDER BY id ASC
@@ -209,21 +215,14 @@ export async function upsertGameMap(
 ) {
     const data = normalizeGameMapData(input, id);
     const checksum = computeGameMapChecksum(data);
-    const current = await pool.query<{ checksum: string }>(
-        "SELECT checksum FROM game_maps WHERE id = $1 LIMIT 1",
-        [id],
-    );
-    const currentChecksum = current.rows[0]?.checksum ?? null;
-
-    if (currentChecksum === checksum) {
-        const unchanged = await getGameMapById(id);
-        return { unchanged: true, map: unchanged };
-    }
 
     const client = await pool.connect();
+    let unchanged = false;
+    let nextRow: GameMapRow | undefined;
+
     try {
         await client.query("BEGIN");
-        await client.query(
+        const upsertResult = await client.query<{ id: number }>(
             `
         INSERT INTO game_maps (
           id, name, terreno, zona, restringir, min_level, max_level, pk,
@@ -248,6 +247,8 @@ export async function upsertGameMap(
                       checksum = EXCLUDED.checksum,
                       updated_by_account_id = EXCLUDED.updated_by_account_id,
                       updated_at = NOW()
+        WHERE game_maps.checksum IS DISTINCT FROM EXCLUDED.checksum
+        RETURNING id
       `,
             [
                 id,
@@ -266,11 +267,28 @@ export async function upsertGameMap(
                 updatedByAccountId ?? null,
             ],
         );
-        const version = await insertRevision(client, id, checksum);
-        await client.query("UPDATE game_maps SET version = $2 WHERE id = $1", [
-            id,
-            version,
-        ]);
+
+        unchanged = (upsertResult.rowCount ?? 0) === 0;
+        if (!unchanged) {
+            const version = await insertRevision(client, id, checksum);
+            await client.query("UPDATE game_maps SET version = $2 WHERE id = $1", [
+                id,
+                version,
+            ]);
+        }
+
+        const nextResult = await client.query<GameMapRow>(
+            `
+      SELECT id, name, terreno, zona, restringir, min_level, max_level, pk,
+             metadata, terrain, npcs, specials, checksum, version::text AS version, updated_at
+      FROM game_maps
+      WHERE id = $1
+      LIMIT 1
+    `,
+            [id],
+        );
+        nextRow = nextResult.rows[0];
+
         await client.query("COMMIT");
     } catch (error) {
         await client.query("ROLLBACK");
@@ -279,8 +297,18 @@ export async function upsertGameMap(
         client.release();
     }
 
-    const next = await getGameMapById(id);
-    return { unchanged: false, map: next };
+    if (!nextRow) {
+        throw new Error("Game map not found after upsert");
+    }
+
+    return {
+        unchanged,
+        map: {
+            ...toGameMapSummary(nextRow),
+            checksum: nextRow.checksum,
+            data: toGameMapData(nextRow),
+        },
+    };
 }
 
 export async function importGameMapsFromSource(
